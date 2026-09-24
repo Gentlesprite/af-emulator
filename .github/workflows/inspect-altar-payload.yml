@@ -21,26 +21,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          : > /tmp/altar_payload.gz
-          for f in .altar_payload/chunk_*.b64; do
-            base64 -d "$f" >> /tmp/altar_payload.gz
-          done
-          gzip -dc /tmp/altar_payload.gz > /tmp/altar_payload
-          file /tmp/altar_payload || true
           python - <<'PY'
           from pathlib import Path
-          import json, tarfile, zipfile
-          p=Path("/tmp/altar_payload")
-          b=p.read_bytes()
+          import base64, gzip, json, tarfile, zipfile
+          parts=[]
+          for p in sorted(Path(".altar_payload").glob("chunk_*.b64")):
+              s="".join(p.read_text(encoding="utf-8").split())
+              print(p.name, "chars=", len(s), "tail=", repr(s[-8:]))
+              parts.append(s)
+          joined="".join(parts)
+          print("joined_chars=", len(joined), "mod4=", len(joined)%4)
+          raw=base64.b64decode(joined + ("="*((-len(joined))%4)), validate=False)
+          print("raw_bytes=", len(raw), "magic=", raw[:8])
+          b=gzip.decompress(raw)
+          out=Path("/tmp/altar_payload")
+          out.write_bytes(b)
           print("payload_bytes=", len(b))
           print("head_repr=", repr(b[:500]))
-          print("is_zip=", zipfile.is_zipfile(p))
-          print("is_tar=", tarfile.is_tarfile(p))
-          if zipfile.is_zipfile(p):
-              with zipfile.ZipFile(p) as z:
+          print("is_zip=", zipfile.is_zipfile(out))
+          print("is_tar=", tarfile.is_tarfile(out))
+          if zipfile.is_zipfile(out):
+              with zipfile.ZipFile(out) as z:
                   print("zip_names=", z.namelist()[:100])
-          elif tarfile.is_tarfile(p):
-              with tarfile.open(p) as t:
+          elif tarfile.is_tarfile(out):
+              with tarfile.open(out) as t:
                   print("tar_names=", t.getnames()[:100])
           else:
               try:
