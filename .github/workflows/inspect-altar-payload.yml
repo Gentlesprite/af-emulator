@@ -17,46 +17,49 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Decode and inspect payload
+      - name: Recover and inspect payload
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
           import base64, gzip, json, tarfile, zipfile
-          parts=[]
-          for p in sorted(Path(".altar_payload").glob("chunk_*.b64")):
-              s="".join(p.read_text(encoding="utf-8").split())
-              print(p.name, "chars=", len(s), "tail=", repr(s[-8:]))
-              parts.append(s)
+          parts=["".join(p.read_text(encoding="utf-8").split()) for p in sorted(Path(".altar_payload").glob("chunk_*.b64"))]
           joined="".join(parts)
-          print("joined_chars=", len(joined), "mod4=", len(joined)%4)
-          raw=base64.b64decode(joined + ("="*((-len(joined))%4)), validate=False)
-          print("raw_bytes=", len(raw), "magic=", raw[:8])
-          b=gzip.decompress(raw)
+          print("joined_chars=",len(joined),"mod4=",len(joined)%4)
+          candidates=list(range(max(0,len(joined)-96),len(joined))) + list(range(96))
+          good=None
+          for pos in candidates:
+              s=joined[:pos]+joined[pos+1:]
+              try:
+                  raw=base64.b64decode(s + ("="*((-len(s))%4)), validate=True)
+                  b=gzip.decompress(raw)
+              except Exception:
+                  continue
+              good=(pos,b)
+              break
+          if good is None:
+              raise SystemExit("No valid one-character deletion found in first/last 96 chars")
+          pos,b=good
+          print("RECOVERED delete_pos=",pos,"deleted_char=",repr(joined[pos]),"payload_bytes=",len(b))
           out=Path("/tmp/altar_payload")
           out.write_bytes(b)
-          print("payload_bytes=", len(b))
-          print("head_repr=", repr(b[:500]))
-          print("is_zip=", zipfile.is_zipfile(out))
-          print("is_tar=", tarfile.is_tarfile(out))
+          print("head_repr=",repr(b[:500]))
+          print("is_zip=",zipfile.is_zipfile(out),"is_tar=",tarfile.is_tarfile(out))
           if zipfile.is_zipfile(out):
-              with zipfile.ZipFile(out) as z:
-                  print("zip_names=", z.namelist()[:100])
+              with zipfile.ZipFile(out) as z: print("zip_names=",z.namelist()[:100])
           elif tarfile.is_tarfile(out):
-              with tarfile.open(out) as t:
-                  print("tar_names=", t.getnames()[:100])
+              with tarfile.open(out) as t: print("tar_names=",t.getnames()[:100])
           else:
               try:
                   obj=json.loads(b.decode("utf-8"))
-                  print("json_type=", type(obj).__name__)
-                  if isinstance(obj, dict):
-                      print("json_keys=", list(obj)[:100])
-                      for k,v in list(obj.items())[:5]:
-                          print("sample_key=", k, "value_type=", type(v).__name__)
-                  elif isinstance(obj, list):
-                      print("json_len=", len(obj))
-                      print("json_sample=", repr(obj[:2])[:1000])
+                  print("json_type=",type(obj).__name__)
+                  if isinstance(obj,dict):
+                      print("json_keys=",list(obj)[:100])
+                      for k,v in list(obj.items())[:10]:
+                          print("sample_key=",k,"value_type=",type(v).__name__)
+                  elif isinstance(obj,list):
+                      print("json_len=",len(obj)); print("json_sample=",repr(obj[:2])[:1500])
               except Exception as e:
-                  print("json_error=", repr(e))
+                  print("json_error=",repr(e))
           PY
