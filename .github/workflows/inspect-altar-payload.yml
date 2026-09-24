@@ -1,0 +1,56 @@
+name: Inspect staged Altar payload
+
+on:
+  push:
+    branches:
+      - altar-solved-v143b-r16
+    paths:
+      - ".github/workflows/inspect-altar-payload.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decode and inspect payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .altar_payload/chunk_*.b64 > /tmp/altar_payload.b64
+          base64 -d /tmp/altar_payload.b64 > /tmp/altar_payload.gz
+          gzip -dc /tmp/altar_payload.gz > /tmp/altar_payload
+          file /tmp/altar_payload || true
+          python - <<'PY'
+          from pathlib import Path
+          import json, tarfile, zipfile
+          p=Path("/tmp/altar_payload")
+          b=p.read_bytes()
+          print("payload_bytes=", len(b))
+          print("head_repr=", repr(b[:500]))
+          print("is_zip=", zipfile.is_zipfile(p))
+          print("is_tar=", tarfile.is_tarfile(p))
+          if zipfile.is_zipfile(p):
+              with zipfile.ZipFile(p) as z:
+                  print("zip_names=", z.namelist()[:100])
+          elif tarfile.is_tarfile(p):
+              with tarfile.open(p) as t:
+                  print("tar_names=", t.getnames()[:100])
+          else:
+              try:
+                  obj=json.loads(b.decode("utf-8"))
+                  print("json_type=", type(obj).__name__)
+                  if isinstance(obj, dict):
+                      print("json_keys=", list(obj)[:100])
+                      for k,v in list(obj.items())[:3]:
+                          print("sample_key=", k, "value_type=", type(v).__name__)
+                  elif isinstance(obj, list):
+                      print("json_len=", len(obj))
+                      print("json_sample=", repr(obj[:2])[:1000])
+              except Exception as e:
+                  print("json_error=", repr(e))
+          PY
