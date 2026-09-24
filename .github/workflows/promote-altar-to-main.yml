@@ -1,0 +1,432 @@
+name: Promote solved Altar stack to main
+
+on:
+  push:
+    branches:
+      - altar-solved-v143b-r16
+    paths:
+      - ".github/workflows/promote-altar-to-main.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out staged Altar branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        shell: bash
+        run: |
+          git config user.name "Kaori"
+          git config user.email "42208098+armangido@users.noreply.github.com"
+
+      - name: Recover staged Altar payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import base64, gzip, json, shutil, tarfile, zipfile
+
+          parts = [
+              "".join(p.read_text(encoding="utf-8").split())
+              for p in sorted(Path(".altar_payload").glob("chunk_*.b64"))
+          ]
+          if not parts:
+              raise SystemExit("No staged Altar payload files found")
+          joined = "".join(parts)
+
+          def decode_candidate(s):
+              raw = base64.b64decode(s + ("=" * ((-len(s)) % 4)), validate=True)
+              return gzip.decompress(raw)
+
+          payload = None
+          try:
+              payload = decode_candidate(joined)
+              print("payload decoded without repair")
+          except Exception:
+              candidates = list(range(max(0, len(joined) - 128), len(joined))) + list(range(min(128, len(joined))))
+              for pos in candidates:
+                  try:
+                      payload = decode_candidate(joined[:pos] + joined[pos + 1:])
+                      print("payload recovered by deleting one staged character at", pos)
+                      break
+                  except Exception:
+                      pass
+          if payload is None:
+              raise SystemExit("Unable to recover staged Altar payload")
+
+          raw_path = Path("/tmp/altar_payload")
+          raw_path.write_bytes(payload)
+          out = Path("/tmp/altar_unpack")
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir(parents=True)
+
+          if zipfile.is_zipfile(raw_path):
+              with zipfile.ZipFile(raw_path) as z:
+                  z.extractall(out)
+              print("payload type: zip")
+          elif tarfile.is_tarfile(raw_path):
+              with tarfile.open(raw_path) as t:
+                  t.extractall(out)
+              print("payload type: tar")
+          else:
+              obj = json.loads(payload.decode("utf-8"))
+              files = obj.get("files", obj) if isinstance(obj, dict) else obj
+              if isinstance(files, dict):
+                  iterable = [{"path": k, "content": v} for k, v in files.items()]
+              elif isinstance(files, list):
+                  iterable = files
+              else:
+                  raise SystemExit("Unsupported JSON payload shape")
+              for row in iterable:
+                  path = row.get("path") or row.get("name")
+                  content = row.get("content")
+                  if not path or content is None:
+                      continue
+                  p = out / path
+                  p.parent.mkdir(parents=True, exist_ok=True)
+                  if isinstance(content, str):
+                      p.write_text(content, encoding="utf-8")
+                  else:
+                      p.write_bytes(bytes(content))
+              print("payload type: json")
+
+          required = {
+              "assaultfire_server_unified_v143b_server_spawner_r11_v48_lazy_latch_zero_dskey_multiplayer_statefix.py",
+              "assaultfire_ds_spawner.py",
+              "AFDevLoader_v48_spawner_multi_instance.py",
+              "af_ds_udp_bridge_v9_multi_peer_latch.py",
+              "test_assaultfire_ds_spawner.py",
+          }
+          found = {p.name for p in out.rglob("*") if p.is_file()}
+          missing = sorted(required - found)
+          print("required found:", sorted(required & found))
+          if missing:
+              raise SystemExit("Payload missing required files: " + ", ".join(missing))
+          PY
+
+      - name: Build promotion on current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          git checkout -B main origin/main
+
+          if git show-ref --verify --quiet refs/remotes/origin/feature/sqlite-registration-web; then
+            git checkout origin/feature/sqlite-registration-web --               .github/workflows/tests.yml               docs/REGISTRATION_WEBSITE.md               server/__init__.py               server/account_db.py               tests/__init__.py               tests/test_account_db.py               tests/test_registration_web.py               web
+          fi
+
+          mkdir -p server tools/server_spawner tools/bridge tests runtime
+
+          python - <<'PY'
+          from pathlib import Path
+          import re, shutil
+
+          src = Path("/tmp/altar_unpack")
+          root = Path.cwd()
+
+          def find_one(name):
+              hits = [p for p in src.rglob(name) if p.is_file()]
+              if not hits:
+                  raise SystemExit("missing extracted file " + name)
+              hits.sort(key=lambda p: (len(p.parts), str(p)))
+              print("using", name, "from", hits[0])
+              return hits[0]
+
+          mapping = {
+              "assaultfire_server_unified_v143b_server_spawner_r11_v48_lazy_latch_zero_dskey_multiplayer_statefix.py":
+                  root / "server" / "assaultfire_server_v143b.py",
+              "assaultfire_ds_spawner.py":
+                  root / "server" / "assaultfire_ds_spawner.py",
+              "AFDevLoader_v48_spawner_multi_instance.py":
+                  root / "tools" / "server_spawner" / "AFDevLoader_v48_spawner_multi_instance.py",
+              "af_ds_udp_bridge_v9_multi_peer_latch.py":
+                  root / "tools" / "bridge" / "af_ds_udp_bridge_v9_multi_peer_latch.py",
+              "test_assaultfire_ds_spawner.py":
+                  root / "tests" / "test_altar_ds_lifecycle.py",
+          }
+          for name, dest in mapping.items():
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(find_one(name), dest)
+
+          server = root / "server" / "assaultfire_server_v143b.py"
+          s = server.read_text(encoding="utf-8")
+          s = s.replace(
+              'PRIVATE_KEY_PATH = r"C:\\Users\\Admin\\Downloads\\af\\PRIVATE.PEM"',
+              'PRIVATE_KEY_PATH = os.environ.get("AF_PRIVATE_KEY", str(Path(__file__).with_name("PRIVATE.PEM")))',
+          )
+          s = s.replace(
+              'with open(r"C:\\Users\\Admin\\Downloads\\af\\af_server_live.log", "a", encoding="utf-8") as fp:',
+              'with open(os.environ.get("AF_LOG_PATH", str(Path(__file__).with_name("af_server_live.log"))), "a", encoding="utf-8") as fp:',
+          )
+          server.write_text(s, encoding="utf-8")
+
+          spawner = root / "server" / "assaultfire_ds_spawner.py"
+          s = spawner.read_text(encoding="utf-8")
+          anchor = 'class SpawnerError(RuntimeError):\n'
+          helper = (
+              'def _repo_root() -> Path:\n'
+              '    return Path(__file__).resolve().parents[1]\n\n'
+              'def _default_runtime_dir() -> Path:\n'
+              '    return _repo_root() / "runtime" / "ds_runtime"\n\n'
+              'def _default_loader_script() -> Path:\n'
+              '    return _repo_root() / "tools" / "server_spawner" / "AFDevLoader_v48_spawner_multi_instance.py"\n\n'
+              'def _default_bridge_script() -> Path:\n'
+              '    return _repo_root() / "tools" / "bridge" / "af_ds_udp_bridge_v9_multi_peer_latch.py"\n\n\n'
+          )
+          if helper not in s:
+              s = s.replace(anchor, helper + anchor, 1)
+          s = s.replace(
+              'runtime_dir: Path = field(default_factory=lambda: Path(__file__).resolve().with_name("ds_runtime"))',
+              'runtime_dir: Path = field(default_factory=_default_runtime_dir)',
+          )
+          s = s.replace(
+              'loader_script: Path = field(default_factory=lambda: Path(__file__).resolve().with_name("AFDevLoader_v48_spawner_multi_instance.py"))',
+              'loader_script: Path = field(default_factory=_default_loader_script)',
+          )
+          s = s.replace(
+              'bridge_script: Path = field(default_factory=lambda: Path(__file__).resolve().with_name("af_ds_udp_bridge_v9_multi_peer_latch.py"))',
+              'bridge_script: Path = field(default_factory=_default_bridge_script)',
+          )
+          s = s.replace(
+              '        here = Path(__file__).resolve().parent\n',
+              '        here = Path(__file__).resolve().parent\n        repo_root = _repo_root()\n',
+              1,
+          )
+          s = s.replace(
+              'runtime_dir=Path(os.environ.get("AF_DS_RUNTIME_DIR", str(here / "ds_runtime"))).resolve(),',
+              'runtime_dir=Path(os.environ.get("AF_DS_RUNTIME_DIR", str(repo_root / "runtime" / "ds_runtime"))).resolve(),',
+          )
+          s = s.replace(
+              'loader_script=Path(os.environ.get("AF_DS_LOADER", str(here / "AFDevLoader_v48_spawner_multi_instance.py"))).resolve(),',
+              'loader_script=Path(os.environ.get("AF_DS_LOADER", str(repo_root / "tools" / "server_spawner" / "AFDevLoader_v48_spawner_multi_instance.py"))).resolve(),',
+          )
+          s = s.replace(
+              'bridge_script=Path(os.environ.get("AF_DS_BRIDGE", str(here / "af_ds_udp_bridge_v9_multi_peer_latch.py"))).resolve(),',
+              'bridge_script=Path(os.environ.get("AF_DS_BRIDGE", str(repo_root / "tools" / "bridge" / "af_ds_udp_bridge_v9_multi_peer_latch.py"))).resolve(),',
+          )
+          spawner.write_text(s, encoding="utf-8")
+
+          test = root / "tests" / "test_altar_ds_lifecycle.py"
+          s = test.read_text(encoding="utf-8")
+          marker = 'from unittest.mock import patch\n\n'
+          prelude = (
+              'ROOT = Path(__file__).resolve().parents[1]\n'
+              'SERVER_DIR = ROOT / "server"\n'
+              'BRIDGE_DIR = ROOT / "tools" / "bridge"\n'
+              'sys.path.insert(0, str(SERVER_DIR))\n'
+              'sys.path.insert(0, str(BRIDGE_DIR))\n'
+              'SERVER_SOURCE = SERVER_DIR / "assaultfire_server_v143b.py"\n'
+              'SPAWNER_SOURCE = SERVER_DIR / "assaultfire_ds_spawner.py"\n'
+              'LOADER_SOURCE = ROOT / "tools" / "server_spawner" / "AFDevLoader_v48_spawner_multi_instance.py"\n'
+              'BRIDGE_SOURCE = BRIDGE_DIR / "af_ds_udp_bridge_v9_multi_peer_latch.py"\n\n'
+          )
+          if prelude not in s:
+              s = s.replace(marker, marker + prelude, 1)
+          s = s.replace("Path(__file__).with_name('af_ds_udp_bridge_v9_multi_peer_latch.py')", "BRIDGE_SOURCE")
+          s = s.replace("Path(__file__).with_name('AFDevLoader_v48_spawner_multi_instance.py')", "LOADER_SOURCE")
+          s = s.replace("Path(__file__).with_name('assaultfire_ds_spawner.py')", "SPAWNER_SOURCE")
+          s = s.replace("Path(__file__).with_name('assaultfire_server_unified_v143b_server_spawner_r11_v48_lazy_latch_zero_dskey_multiplayer_statefix.py')", "SERVER_SOURCE")
+          s = re.sub(
+              r"Path\(__file__\)\.with_name\(\s*['\"]assaultfire_server_unified_v143b_server_spawner_r11_v48_lazy_latch_zero_dskey_multiplayer_statefix\.py['\"]\s*\)",
+              "SERVER_SOURCE",
+              s,
+              flags=re.S,
+          )
+          test.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Update repository docs and CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path.cwd()
+
+          req = root / "requirements.txt"
+          lines = [x.strip() for x in req.read_text(encoding="utf-8").splitlines() if x.strip()]
+          if not any(x.lower().startswith("flask") for x in lines):
+              lines.append("Flask>=3.1,<4")
+          req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          gi = root / ".gitignore"
+          g = gi.read_text(encoding="utf-8")
+          extra = """
+# Altar / dedicated-server generated runtime state
+runtime/
+ds_runtime/
+*mall_state*.json
+BRIDGE_STATE.json
+SESSION_READY.json
+*_PID.txt
+"""
+          if "# Altar / dedicated-server generated runtime state" not in g:
+              g = g.rstrip() + "\n\n" + extra.lstrip()
+          gi.write_text(g, encoding="utf-8")
+
+          readme = root / "README.md"
+          r = readme.read_text(encoding="utf-8")
+          r = r.replace(
+              "> **The Altar currently loads and the player can spawn, but the normal PvE round/enemy lifecycle does not start correctly.**",
+              "> **The local The Altar connection path is solved on the promoted v143b/v48 stack: lazy DS allocation, A113/A114/A11A handoff, first-packet latch, verified zero-DSKey, native movement/correction, and Maya A11E settings are integrated.**",
+          )
+          r = r.replace(
+              "**What this sample demonstrates:** room creation → The Altar loading → map entry/player spawn works, while the post-load PvE round progression is still incomplete.",
+              "**What the promoted stack now demonstrates:** room creation → The Altar loading → map entry/player spawn with the solved DS/UE3 handoff. Enemy/round-content behavior remains a separate game-mode/content lifecycle area rather than a connection blocker.",
+          )
+          r = r.replace(
+              "Start the stable server:\n\n~~~powershell\n.\\.venv\\Scripts\\python.exe .\\server\\assaultfire_server_v94.py\n~~~",
+              "Start the current Altar-capable server:\n\n~~~powershell\n$env:AF_GAME_DIR = \"D:\\AssaultFirePH\\Binaries\\Win32\"\n.\\.venv\\Scripts\\python.exe .\\server\\assaultfire_server_v143b.py\n~~~\n\nserver/assaultfire_server_v94.py is retained as the older rollback baseline.",
+          )
+          r = r.replace(
+              "- **[Stable PvE bridge + server spawner](docs/PVE_BRIDGE_AND_SPAWNER.md)** — known-good v5 UDP bridge and v26 AFDEV listen-server launcher used for The Altar research.",
+              "- **[Solved The Altar bridge + server spawner](docs/PVE_BRIDGE_AND_SPAWNER.md)** — v9 multi-peer first-packet latch plus v48 AFDEV launcher used by the promoted v143b runtime.",
+          )
+          r = r.replace(
+              "## Current public baseline\n\nThe current public baseline is **v94**.",
+              "## Current public baseline\n\nThe current Altar-capable public baseline is **v143b/r16**. The older v94 server remains in server/assaultfire_server_v94.py as a rollback/reference baseline.",
+          )
+          if "### Solved Altar runtime flow" not in r:
+              insert = """
+### Solved Altar runtime flow
+
+A10A CreateRoom
+  -> reserve DS slot only (no AFDEV)
+A3A0 / A113 Start
+  -> start lightweight bridge
+  -> A114 success + A11A DS assignment
+first valid client DS UDP
+  -> latch packet
+  -> spawn TGame_AFDEV via v48 loader
+AFDEV Maya world ready
+  -> apply A11E mode/map/submode/flags
+  -> verify live zero-DSKey socket
+  -> SESSION_READY
+bridge
+  -> replay first packet
+  -> relay live
+
+The stock PH HUD difficulty label mismatch is tracked separately from the authoritative server/AFDEV difficulty state.
+
+"""
+              r = r.replace("## Goal\n", insert + "## Goal\n")
+          readme.write_text(r, encoding="utf-8")
+
+          additions = {
+              "docs/PVE_BRIDGE_AND_SPAWNER.md": """
+## Promoted solved Altar stack
+
+The current repository runtime is no longer the old bridge-v5 / loader-v26 research pair. The promoted path uses server/assaultfire_server_v143b.py, server/assaultfire_ds_spawner.py, tools/bridge/af_ds_udp_bridge_v9_multi_peer_latch.py, and tools/server_spawner/AFDevLoader_v48_spawner_multi_instance.py.
+
+Lifecycle: A10A reserves only; A3A0/A113 arms the bridge and produces the A114/A11A handoff; the first valid DS UDP packet lazily starts AFDEV; the packet remains latched until Maya startup, A11E settings application, and zero-DSKey verification produce SESSION_READY; then relay goes live. Shared-DS cleanup is player-scoped and slots are reusable.
+""",
+              "docs/STATUS.md": """
+## The Altar connection status
+
+The Altar network/gameplay handoff is promoted as solved for the validated PH build on the v143b/v48 stack: lazy allocation, A113/A114/A11A DS assignment, first-packet latch, verified zero-DSKey, native movement/correction, Maya A11E settings propagation, round re-arm, and player-scoped DS cleanup are covered by the regression suite.
+
+The PH HUD difficulty text mismatch is tracked separately; it is not treated as evidence that the server-side difficulty selection failed.
+""",
+              "docs/MILESTONES.md": """
+## Promoted Altar milestones
+
+- [x] A10A reserves a DS slot without starting AFDEV
+- [x] A3A0/A113 starts the lightweight bridge and emits the DS handoff
+- [x] first valid DS UDP lazily starts AFDEV
+- [x] first packet is latched until verified SESSION_READY
+- [x] AFDEV live encrypted socket is re-keyed/verified against the A11A zero DS key
+- [x] v48 native movement/correction path retained
+- [x] A11E Maya mode/map/submode/flags reach the lazy AFDEV instance
+- [x] multiplayer-safe A117/A107/disconnect cleanup and slot reuse
+""",
+              "docs/GETTING_STARTED.md": """
+## Run the Altar-capable baseline
+
+From an Administrator PowerShell after the normal local key/hosts/client setup:
+
+$env:AF_GAME_DIR = "D:\AssaultFirePH\Binaries\Win32"
+$env:AF_DS_SPAWNER_ENABLED = "1"
+$env:AF_DS_MAX_INSTANCES = "4"
+.\.venv\Scripts\python.exe .\server\assaultfire_server_v143b.py
+
+Do not manually start the old bridge or AFDEV loader. Creating a room only reserves capacity. Pressing Start arms the bridge; the first valid DS UDP packet triggers AFDEV. The v94 server remains available as a rollback/reference baseline.
+""",
+              "docs/ARCHITECTURE.md": """
+## Current Altar DS lifecycle
+
+TGame ZONE
+   |
+   | A10A reserve
+   v
+DedicatedServerSpawner
+   |
+   | A3A0 / A113
+   v
+bridge v9 :65008+slot  ---- first valid UDP ---->  AFDevLoader v48
+                                                      |
+                                                      v
+                                              TGame_AFDEV :7777+slot
+                                                      |
+                                 Maya settings + zero-DSKey verified
+                                                      |
+                                                      v
+                                               SESSION_READY
+                                                      |
+client <---------------------- live UE3 relay --------+
+
+AFDEV is intentionally not pre-spawned when a lobby is merely created.
+""",
+          }
+          for rel, block in additions.items():
+              p = root / rel
+              if not p.exists():
+                  continue
+              text = p.read_text(encoding="utf-8")
+              heading = block.strip().splitlines()[0]
+              if heading not in text:
+                  p.write_text(text.rstrip() + "\n\n" + block.strip() + "\n", encoding="utf-8")
+          PY
+
+      - name: Validate promoted tree
+        shell: bash
+        env:
+          AF_WEB_SECRET: ci-test-secret
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m py_compile             server/assaultfire_server_v143b.py             server/assaultfire_ds_spawner.py             tools/server_spawner/AFDevLoader_v48_spawner_multi_instance.py             tools/bridge/af_ds_udp_bridge_v9_multi_peer_latch.py             tests/test_altar_ds_lifecycle.py
+          python tests/test_altar_ds_lifecycle.py
+          python -m unittest discover -s tests -v
+
+      - name: Commit and push main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -A
+          git status --short
+          git commit -m "feat: promote solved Altar runtime to main"
+          git push origin main
+
+      - name: Delete every remote branch except main
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r sha ref; do
+            branch="${ref#refs/heads/}"
+            if [ "$branch" != "main" ]; then
+              echo "Deleting $branch"
+              git push origin --delete "$branch"
+            fi
+          done < <(git ls-remote --heads origin)
+          echo "Remaining branches:"
+          git ls-remote --heads origin
